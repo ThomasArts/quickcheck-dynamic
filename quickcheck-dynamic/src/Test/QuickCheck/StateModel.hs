@@ -113,6 +113,29 @@ class
   precondition :: state -> Action state a -> Bool
   precondition _ _ = True
 
+data Assertion = Ok | Failed String
+  deriving (Ord, Eq, Show)
+
+isOk :: Assertion -> Bool
+isOk = (Ok ==)
+
+class Assertable m r where
+  assertion :: r -> m Assertion
+  ok :: r
+
+instance Applicative m => Assertable m Assertion where
+  assertion = pure
+  ok = Ok
+
+instance forall m r. (Monad m, Assertable m r) => Assertable m (m r) where
+  assertion = join . fmap assertion
+  ok = pure (ok @m @r)
+
+instance Applicative m => Assertable m Bool where
+  assertion True  = assertion Ok
+  assertion False = assertion $ Failed ""
+  ok = True
+
 -- TODO: maybe it makes sense to write
 -- out a long list of these instances
 type family Realized (m :: Type -> Type) a :: Type
@@ -136,8 +159,19 @@ class Monad m => RunModel state m where
   -- | Postcondition on the `a` value produced at some step.
   -- The result is `assert`ed and will make the property fail should it be `False`. This is useful
   -- to check the implementation produces expected values.
-  postcondition :: forall a. (state, state) -> Action state a -> LookUp m -> Realized m a -> m Bool
-  postcondition _ _ _ _ = pure True
+
+  postcondition :: forall a r. Assertable m r
+                => (state, state)
+                -> Action state a
+                -> LookUp m
+                -> Realized m a
+  -- TODO: The problem here is the type parameter `r` -
+  -- it has to be put *somewhere* but here we would like it to
+  -- be existentially quantified. The solution is to put it in the
+  -- argument list to the `RunModel` class but this is not necessarily
+  -- a nice solution
+                -> r
+  postcondition _ _ _ _ = ok @m @r
 
   -- | Allows the user to attach information to the `Property` at each step of the process.
   -- This function is given the full transition that's been executed, including the start and ending
@@ -326,6 +360,10 @@ runActionsInState st (Actions_ rejected (Smart _ actions)) = loop st [] actions
         s' = nextState s act var
         env' = (var :== ret) : env
     monitor (monitoring @state @m (s, s') act (lookUpVar env') ret)
-    b <- run $ postcondition (s, s') act (lookUpVar env) ret
-    assert b
+    a <- run . assertion @m $ postcondition @state @m (s, s') act (lookUpVar env) ret
+    case a of
+      Ok -> return ()
+      Failed msg -> do
+        monitor (counterexample msg)
+        assert False
     loop s' env' as
